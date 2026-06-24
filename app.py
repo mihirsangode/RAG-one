@@ -260,29 +260,27 @@ def render_chat() -> None:
 # ---------------------------------------------------------------------------
 
 def main() -> None:
+    # 1. Render the sidebar first so the user sees the layout immediately.
+    render_sidebar()
+    
+    # 2. Render the main title before starting the heavy loading.
+    st.title("Knowledge Assistant")
+
+    # 3. Catch configuration errors and show a spinner during network calls.
     try:
-        # Resolve and load cached backend clients
-        get_clients()
-    except Exception as exc:
-        # Display configuration issues gracefully
+        with st.spinner("Connecting to knowledge base..."):
+            get_clients()
+    except Exception as exc:  # noqa: BLE001 - configuration errors -> friendly stop
         st.error(
             "Configuration error: "
             f"{exc}\n\nCheck your environment variables (.env) and restart."
         )
         st.stop()
 
-    # Render the layout components in order
-    render_sidebar()
+    # 4. Render the rest of the chat interface only after clients are ready.
+    # Note: We need to remove st.title("Knowledge Assistant") from the top 
+    # of the render_chat() function so it does not render twice.
     render_chat()
-
-# This block ensures main() only runs once when the file is executed directly
-if __name__ == "__main__":
-    main()
-
-# CRITICAL: Check below this line. Delete any stray calls like:
-# render_chat() 
-# or 
-# st.title("Knowledge Assistant")
 
 if __name__ == "__main__":
     main()
