@@ -178,12 +178,14 @@ def render_sidebar() -> None:
         st.session_state.syncing = True
 
     st.sidebar.button(
-        "Sync Knowledge Base",
-        type="primary",
-        use_container_width=True,
-        disabled=st.session_state.syncing,
-        on_click=_begin_sync,
-    )
+    "Sync Knowledge Base",
+    type="primary",
+    use_container_width=True,
+    disabled=st.session_state.syncing,
+    on_click=_begin_sync,
+    # Explicitly defining a unique key prevents element identifier collisions
+    key="sync_knowledge_base_tool_button", 
+)
 
     if st.session_state.syncing:
         progress = st.sidebar.progress(0.0, text="Starting sync...")
