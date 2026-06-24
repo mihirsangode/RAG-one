@@ -1,0 +1,6 @@
+langchain-google-community[drive]
+langchain-openai
+pinecone
+pypdf
+python-dotenv
+streamlit
