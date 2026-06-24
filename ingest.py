@@ -210,21 +210,23 @@ class PyPDFBytesLoader(BaseLoader):
                 logger.warning("Skipping encrypted PDF (no usable password).")
                 return []
 
-        parts: List[str] = []
-        for page_number, page in enumerate(reader.pages):
+        documents: List[Document] = []
+        # Start enumeration at 1 to align with human-readable page numbers
+        for page_number, page in enumerate(reader.pages, start=1):
             try:
                 text = page.extract_text() or ""
             except Exception as exc:  # noqa: BLE001 - per-page resilience
                 logger.warning("Failed to extract page %d: %s", page_number, exc)
                 text = ""
+            
             if text.strip():
-                parts.append(text)
+                # Create a separate Document for each page, storing the page number in metadata
+                documents.append(Document(page_content=text, metadata={"page": page_number}))
 
-        if not parts:
+        if not documents:
             return []
-
-        return [Document(page_content="\n\n".join(parts), metadata={})]
-
+            
+        return documents
 
 # ---------------------------------------------------------------------------
 # Dependency-free recursive character text splitter
@@ -467,6 +469,9 @@ def sync_knowledge_base() -> Iterator[ProgressEvent]:
                 chunk_counter[drive_file_id] += 1
                 pending_ids.append(make_vector_id(drive_file_id, chunk_index))
                 pending_texts.append(chunk)
+                # Retrieve the page number from the document metadata, defaulting to "Unknown"
+                page_num = metadata.get("page", "Unknown")
+
                 pending_meta.append(
                     {
                         "text": chunk,
@@ -474,6 +479,7 @@ def sync_knowledge_base() -> Iterator[ProgressEvent]:
                         "title": str(title),
                         "file_id": drive_file_id,
                         "chunk_index": chunk_index,
+                        "page": page_num, # Append the specific page number to the Pinecone payload
                     }
                 )
                 chunks_total += 1
