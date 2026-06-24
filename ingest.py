@@ -81,35 +81,22 @@ class Settings:
     pinecone_cloud: str
     pinecone_region: str
     index_name: str
-    drive_folder_id: str
+    # Ensure this line exists so the __init__ method accepts the argument
+    drive_folder_id: str 
     chunk_size: int
     chunk_overlap: int
 
     @classmethod
     def from_env(cls) -> "Settings":
-        missing = [
-            key
-            for key in (
-                "OPENAI_API_KEY",
-                "PINECONE_API_KEY",
-                "PINECONE_INDEX_NAME",
-                "GOOGLE_DRIVE_FOLDER_ID",
-            )
-            if not os.getenv(key)
-        ]
-        if missing:
-            raise EnvironmentError(
-                f"Missing required environment variables: {', '.join(missing)}"
-            )
-
+        # Keep your hardcoded approach here if testing, or revert to os.environ
         return cls(
-            openai_api_key=os.environ["OPENAI_API_KEY"],
+            openai_api_key=os.environ.get("OPENAI_API_KEY", ""),
             embedding_model=os.getenv("OPENAI_EMBEDDING_MODEL", "text-embedding-3-small"),
-            pinecone_api_key=os.environ["PINECONE_API_KEY"],
+            pinecone_api_key=os.environ.get("PINECONE_API_KEY", ""),
             pinecone_cloud=os.getenv("PINECONE_CLOUD", "aws"),
             pinecone_region=os.getenv("PINECONE_REGION", "us-east-1"),
-            index_name=os.environ["PINECONE_INDEX_NAME"],
-            drive_folder_id=os.environ["GOOGLE_DRIVE_FOLDER_ID"],
+            index_name=os.environ.get("PINECONE_INDEX_NAME", "rag-knowledge-base"),
+            drive_folder_id="1-1sQtFd_zVRE4H4R-rrOGCZnzYdQQ8Zb", # Hardcoded ID
             chunk_size=int(os.getenv("CHUNK_SIZE", "1000")),
             chunk_overlap=int(os.getenv("CHUNK_OVERLAP", "150")),
         )
@@ -380,31 +367,27 @@ def ensure_index_ready(settings: Settings):
 # Document streaming
 # ---------------------------------------------------------------------------
 
-def _document_stream(settings: Settings, service_account_path: Path) -> Iterable:
-    """Yield LangChain ``Document`` objects one at a time from the Drive folder.
+from typing import Iterable
+from pathlib import Path
+from langchain_google_community import GoogleDriveLoader
 
-    Uses ``lazy_load`` so documents are pulled and released incrementally
-    rather than materialising the entire folder in memory.
-    """
+def _document_stream(settings: Settings, service_account_path: Path) -> Iterable:
+    """Yield LangChain Document objects from an entire Google Drive folder."""
     from langchain_google_community import GoogleDriveLoader
 
     loader = GoogleDriveLoader(
-        folder_id=settings.drive_folder_id,
+        folder_id=settings.drive_folder_id,  # Use the folder ID from settings
         service_account_key=service_account_path,
-        recursive=True,
-        # Google-native docs (Docs/Sheets/Slides) are exported as text by the
-        # loader itself; any binary file (notably PDFs) is routed through our
-        # pypdf byte-stream adapter instead of the heavy ``unstructured`` stack.
+        recursive=True, # Set to True to include subfolders
+        scopes=["https://www.googleapis.com/auth/drive.readonly"], # Ensure read-only scope
         file_loader_cls=PyPDFBytesLoader,
         file_loader_kwargs={},
     )
 
-    # Prefer lazy_load; fall back to load() if a connector version lacks it.
     if hasattr(loader, "lazy_load"):
         yield from loader.lazy_load()
-    else:  # pragma: no cover - compatibility shim
+    else: 
         yield from loader.load()
-
 
 # ---------------------------------------------------------------------------
 # Public pipeline

@@ -62,7 +62,7 @@ services:
 
       # --- Google Drive (Service Account) ----------------------------------
       - key: GOOGLE_DRIVE_FOLDER_ID
-        value: 1qKB8MfR7MndiS4RlW81IyFEPh86cFVje
+        value: 1-1sQtFd_zVRE4H4R-rrOGCZnzYdQQ8Zb
       # Full Service Account JSON string. Secret; escaped "\n" auto-repaired.
       - key: GOOGLE_CREDENTIALS_JSON
         sync: false

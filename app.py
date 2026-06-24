@@ -50,41 +50,26 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-st.markdown(
-    """
-    <style>
-      /* Hide Streamlit chrome for a clean, app-like surface. */
-      #MainMenu {visibility: hidden;}
-      footer {visibility: hidden;}
-      header {visibility: hidden;}
-      div[data-testid="stToolbar"] {visibility: hidden; height: 0;}
-      div[data-testid="stDecoration"] {display: none;}
-      div[data-testid="stStatusWidget"] {visibility: hidden;}
-
-      /* Tighten top padding reclaimed from the hidden header. */
-      div.block-container {padding-top: 2rem; padding-bottom: 6rem;}
-
-      /* Mobile Safari / iOS web: stop font auto-zoom and respect safe areas. */
-      html, body, [class*="css"] {
-        -webkit-text-size-adjust: 100%;
-        text-size-adjust: 100%;
-      }
-      @supports (padding: max(0px)) {
-        div.block-container {
-          padding-left: max(1rem, env(safe-area-inset-left));
-          padding-right: max(1rem, env(safe-area-inset-right));
-        }
-      }
-
-      /* Subtle polish on chat bubbles. */
-      div[data-testid="stChatMessage"] {
-        border-radius: 14px;
-        padding: 0.25rem 0.25rem;
-      }
-    </style>
-    """,
-    unsafe_allow_html=True,
+# st.set_page_config remains the same
+st.set_page_config(
+    page_title="Knowledge Assistant",
+    page_icon="brain",
+    layout="centered",
+    initial_sidebar_state="expanded",
 )
+
+# DELETE OR COMMENT OUT THIS ENTIRE BLOCK
+# st.markdown(
+#     """
+#     <style>
+#       /* Hide Streamlit chrome for a clean, app-like surface. */
+# ... [rest of the CSS] ...
+#     </style>
+#     """,
+#     unsafe_allow_html=True,
+# )
+
+# The rest of your code continues below
 
 
 # ---------------------------------------------------------------------------
@@ -275,8 +260,16 @@ def render_chat() -> None:
 # ---------------------------------------------------------------------------
 
 def main() -> None:
+    # 1. Render the sidebar first so the user sees the layout immediately.
+    render_sidebar()
+    
+    # 2. Render the main title before starting the heavy loading.
+    st.title("Knowledge Assistant")
+
+    # 3. Catch configuration errors and show a spinner during network calls.
     try:
-        get_clients()
+        with st.spinner("Connecting to knowledge base..."):
+            get_clients()
     except Exception as exc:  # noqa: BLE001 - configuration errors -> friendly stop
         st.error(
             "Configuration error: "
@@ -284,9 +277,10 @@ def main() -> None:
         )
         st.stop()
 
-    render_sidebar()
+    # 4. Render the rest of the chat interface only after clients are ready.
+    # Note: We need to remove st.title("Knowledge Assistant") from the top 
+    # of the render_chat() function so it does not render twice.
     render_chat()
-
 
 if __name__ == "__main__":
     main()
