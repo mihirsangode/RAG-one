@@ -35,7 +35,7 @@ SYSTEM_PROMPT = (
     "You are a precise knowledge assistant. Answer the user's question using "
     "ONLY the provided context. If the context does not contain the answer, "
     "say you don't have that information in the knowledge base. Be concise, "
-    "and cite the source titles you relied on."
+    "and cite the source titles and exact page numbers you relied on using the format: (Title, pg. X)."
 )
 
 
@@ -134,8 +134,10 @@ def build_messages(query: str, contexts: List[dict]) -> List[dict]:
         blocks = []
         for i, ctx in enumerate(contexts, start=1):
             title = ctx.get("title", "Unknown source")
+            page = ctx.get("page", "Unknown") # Extract the page number from the Pinecone metadata
             text = ctx.get("text", "")
-            blocks.append(f"[Source {i}: {title}]\n{text}")
+            # Inject the page number directly into the context block read by the AI
+            blocks.append(f"[Source {i}: {title}, Page: {page}]\n{text}")
         context_str = "\n\n---\n\n".join(blocks)
     else:
         context_str = "(no relevant context found in the knowledge base)"
