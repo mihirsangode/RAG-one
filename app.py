@@ -34,8 +34,11 @@ TOP_K = int(os.getenv("TOP_K", "4"))
 SYSTEM_PROMPT = (
     "You are a precise knowledge assistant. Answer the user's question using "
     "ONLY the provided context. If the context does not contain the answer, "
-    "say you don't have that information in the knowledge base. Be concise, "
-    "and cite the source titles and exact page numbers you relied on using the format: (Title, pg. X)."
+    "say you don't have that information. "
+    "CRITICAL RULES FOR CITATIONS:\n"
+    "1. Include an inline citation for every claim you generate.\n"
+    "2. Use the exact format: (Title, pg. X) at the end of each sentence.\n"
+    "3. Do not combine citations. Cite the specific page."
 )
 
 
@@ -223,8 +226,6 @@ def render_sidebar() -> None:
 # ---------------------------------------------------------------------------
 
 def render_chat() -> None:
-    st.title("Knowledge Assistant")
-
     if "messages" not in st.session_state:
         st.session_state.messages = []
 
@@ -247,14 +248,20 @@ def render_chat() -> None:
         answer = st.write_stream(stream_answer(messages))
 
         if contexts:
-            seen = []
+            # 2. Use a set to track distinct combinations of title and page
+            seen_sources = set()
             for ctx in contexts:
                 title = ctx.get("title", "Unknown source")
-                if title not in seen:
-                    seen.append(title)
+                page = ctx.get("page", "Unknown")
+                
+                # Combine title and page into a single string for display
+                source_label = f"{title}, pg. {page}"
+                seen_sources.add(source_label)
+            
             with st.expander("Sources"):
-                for title in seen:
-                    st.markdown(f"- {title}")
+                # Sort the distinct sources alphabetically for clean reading
+                for source in sorted(seen_sources):
+                    st.markdown(f"- {source}")
 
     st.session_state.messages.append({"role": "assistant", "content": answer})
 
