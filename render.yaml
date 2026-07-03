@@ -1,32 +1,13 @@
-# =============================================================================
-# Render Blueprint - RAG Knowledge Assistant
-# -----------------------------------------------------------------------------
-# Deploys the Streamlit app as a managed web service. Secrets are declared with
-# `sync: false` so their values are entered (and stored encrypted) in the Render
-# dashboard rather than committed to the repo.
-#
-# GOOGLE CREDENTIALS HANDLING
-# ---------------------------
-# Paste the ENTIRE Service Account JSON (a single line is fine) into the
-# GOOGLE_CREDENTIALS_JSON dashboard field. Dashboards typically deliver the
-# embedded PEM `private_key` with literal "\n" sequences instead of real
-# newlines; ingest.py (_resolve_service_account_path) detects and repairs this
-# (`"\\n" -> "\n"`) before writing a transient key file, so no manual escaping
-# is required here. Do NOT use a file path in production.
-# =============================================================================
-
 services:
+  # Your existing Streamlit application configuration remains here
   - type: web
     name: rag-knowledge-assistant
     runtime: python
-    plan: starter            # 512 MB RAM; the ingest stream is built for this.
+    plan: starter
     region: oregon
     branch: main
     autoDeploy: true
-
     buildCommand: pip install --no-cache-dir -r requirements.txt
-
-    # Streamlit must bind to Render's injected $PORT on 0.0.0.0 and run headless.
     startCommand: >-
       streamlit run app.py
       --server.port $PORT
@@ -34,23 +15,16 @@ services:
       --server.headless true
       --server.enableCORS false
       --server.enableXsrfProtection true
-
     healthCheckPath: /_stcore/health
-
     envVars:
-      # --- Runtime ---------------------------------------------------------
       - key: PYTHON_VERSION
         value: "3.11.9"
-
-      # --- OpenAI (secret) -------------------------------------------------
       - key: OPENAI_API_KEY
         sync: false
       - key: OPENAI_CHAT_MODEL
         value: gpt-4o-mini
       - key: OPENAI_EMBEDDING_MODEL
         value: text-embedding-3-small
-
-      # --- Pinecone --------------------------------------------------------
       - key: PINECONE_API_KEY
         sync: false
       - key: PINECONE_CLOUD
@@ -59,31 +33,30 @@ services:
         value: us-east-1
       - key: PINECONE_INDEX_NAME
         value: rag-knowledge-base
-
-      # --- Google Drive (Service Account) ----------------------------------
       - key: GOOGLE_DRIVE_FOLDER_ID
         value: 1-1sQtFd_zVRE4H4R-rrOGCZnzYdQQ8Zb
-      # Full Service Account JSON string. Secret; escaped "\n" auto-repaired.
       - key: GOOGLE_CREDENTIALS_JSON
         sync: false
 
-      # --- Retrieval tuning ------------------------------------------------
-      - key: CHUNK_SIZE
-        value: "1000"
-      - key: CHUNK_OVERLAP
-        value: "150"
-      - key: TOP_K
-        value: "4"
-
-services:
-  - type: web # Your existing Streamlit UI
-    name: rag-tool-ui
-    ...
-  - type: worker # The new webhook listener
+  # The corrected Webhook Listener service
+  - type: web
     name: rag-webhook-listener
-    env: python
-    buildCommand: pip install -r requirements.txt
-    startCommand: uvicorn webhook_listener:app --host 0.0.0.0 --port 10000
+    runtime: python
+    plan: starter
+    region: oregon
+    branch: main
+    autoDeploy: true
+    buildCommand: pip install --no-cache-dir -r requirements.txt
+    # uvicorn reads the $PORT environment variable automatically assigned by Render
+    startCommand: uvicorn webhook_listener:app --host 0.0.0.0 --port $PORT
     envVars:
+      - key: PYTHON_VERSION
+        value: "3.11.9"
+      - key: OPENAI_API_KEY
+        sync: false
+      - key: PINECONE_API_KEY
+        sync: false
+      - key: GOOGLE_DRIVE_FOLDER_ID
+        value: 1-1sQtFd_zVRE4H4R-rrOGCZnzYdQQ8Zb
       - key: GOOGLE_CREDENTIALS_JSON
         sync: false
