@@ -23,13 +23,18 @@ from typing import Iterator, List
 
 import streamlit as st
 from dotenv import load_dotenv
+from flashrank import Ranker, RerankRequest
 
 from ingest import Settings, sync_knowledge_base
 
 load_dotenv()
 
 CHAT_MODEL = os.getenv("OPENAI_CHAT_MODEL", "gpt-4o-mini")
-TOP_K = int(os.getenv("TOP_K", "4"))
+TOP_K = int(os.getenv("TOP_K", "50"))
+RERANK_TOP_K = int(os.getenv("RERANK_TOP_K", "10"))
+
+# Initialize the local ranker (downloads a tiny ~30MB model on first run)
+ranker = Ranker(model_name="ms-marco-TinyBERT-L-2-v2")
 
 SYSTEM_PROMPT = (
     "You are a precise knowledge assistant. Answer the user's question using "
@@ -109,6 +114,32 @@ def retrieve_context(query: str):
         metadata = match["metadata"] if isinstance(match, dict) else match.metadata
         results.append(dict(metadata or {}))
     return results
+
+
+def rerank_contexts(query: str, contexts: List[dict]) -> List[dict]:
+    """Score the retrieved chunks locally."""
+    if not contexts:
+        return []
+
+    # Format the data exactly as FlashRank expects it
+    passages = []
+    for i, ctx in enumerate(contexts):
+        passages.append({
+            "id": i,
+            "text": ctx.get("text", ""),
+            "meta": ctx
+        })
+
+    # Execute the local reranking model
+    rerankrequest = RerankRequest(query=query, passages=passages)
+    results = ranker.rerank(rerankrequest)
+
+    # Extract the top N results and return their original metadata
+    reranked_results = []
+    for result in results[:RERANK_TOP_K]:
+        reranked_results.append(result["meta"])
+
+    return reranked_results
 
 
 def build_messages(query: str, contexts: List[dict]) -> List[dict]:
@@ -224,13 +255,14 @@ def render_chat() -> None:
     with st.chat_message("assistant"):
         with st.spinner("Searching the knowledge base..."):
             contexts = retrieve_context(prompt)
-            messages = build_messages(prompt, contexts)
+            reranked_contexts = rerank_contexts(prompt, contexts)
+            messages = build_messages(prompt, reranked_contexts)
         answer = st.write_stream(stream_answer(messages))
 
-        if contexts:
+        if reranked_contexts:
             # 2. Use a set to track distinct combinations of title and page
             seen_sources = set()
-            for ctx in contexts:
+            for ctx in reranked_contexts:
                 title = ctx.get("title", "Unknown source")
                 page = ctx.get("page", "Unknown")
                 
