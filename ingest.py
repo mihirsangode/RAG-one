@@ -411,22 +411,91 @@ def ensure_index_ready(settings: Settings):
 # ---------------------------------------------------------------------------
 
 def _document_stream(settings: Settings, service_account_path: Path) -> Iterable:
-    """Yield LangChain Document objects from an entire Google Drive folder."""
-    from langchain_google_community import GoogleDriveLoader
+    """Yield LangChain Document objects by fetching files concurrently in paginated batches."""
+    import io
+    import concurrent.futures
+    from google.oauth2 import service_account
+    from googleapiclient.discovery import build
+    from googleapiclient.http import MediaIoBaseDownload
+    from langchain_core.documents import Document
 
-    loader = GoogleDriveLoader(
-        folder_id=settings.drive_folder_id,  # Use the folder ID from settings
-        service_account_key=service_account_path,
-        recursive=True, # Set to True to include subfolders
-        scopes=["https://www.googleapis.com/auth/drive.readonly"], # Ensure read-only scope
-        file_loader_cls=PyPDFBytesLoader,
-        file_loader_kwargs={},
+    # Authenticate with the Google Drive API
+    creds = service_account.Credentials.from_service_account_file(
+        service_account_path, 
+        scopes=["https://www.googleapis.com/auth/drive.readonly"]
     )
+    service = build('drive', 'v3', credentials=creds)
 
-    if hasattr(loader, "lazy_load"):
-        yield from loader.lazy_load()
-    else: 
-        yield from loader.load()
+    query = f"'{settings.drive_folder_id}' in parents and mimeType='application/pdf' and trashed=false"
+    page_token = None
+    
+    # Restrict concurrent downloads to 3 to prevent exceeding 512 MB of RAM
+    MAX_CONCURRENT_DOWNLOADS = 3
+
+    # Define the worker function that downloads and parses a single file
+    def download_and_parse(file_item: dict) -> list[Document]:
+        file_id = file_item['id']
+        file_name = file_item['name']
+        
+        # Download the binary file into a temporary memory stream
+        request = service.files().get_media(fileId=file_id)
+        file_stream = io.BytesIO()
+        downloader = MediaIoBaseDownload(file_stream, request)
+        
+        done = False
+        while not done:
+            _, done = downloader.next_chunk()
+        
+        file_stream.seek(0)
+        
+        # Extract the text using the existing loader
+        loader = PyPDFBytesLoader(file_stream)
+        docs = loader.load()
+        
+        # Attach metadata to each page
+        for doc in docs:
+            doc.metadata["source"] = f"https://docs.google.com/file/d/{file_id}/edit"
+            doc.metadata["title"] = file_name
+            doc.metadata["file_id"] = file_id
+            
+        # Explicitly clear the memory stream once extraction is complete
+        file_stream.close()
+            
+        return docs
+
+    # Loop continuously until all pages of the Google Drive folder are read
+    while True:
+        # Request a maximum of 100 file names per API call to keep memory flat
+        results = service.files().list(
+            q=query, 
+            pageSize=100, 
+            pageToken=page_token,
+            fields="nextPageToken, files(id, name)"
+        ).execute()
+        
+        items = results.get('files', [])
+
+        if not items:
+            break
+
+        # Execute downloads concurrently for the current batch of 100 files
+        with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_CONCURRENT_DOWNLOADS) as executor:
+            future_to_file = {executor.submit(download_and_parse, item): item for item in items}
+            
+            for future in concurrent.futures.as_completed(future_to_file):
+                try:
+                    docs = future.result()
+                    yield from docs
+                except Exception as exc:
+                    failed_item = future_to_file[future]
+                    logger.error("Failed to process file '%s': %s", failed_item.get('name'), exc)
+
+        # Retrieve the token for the next page of 100 files
+        page_token = results.get('nextPageToken')
+        
+        # Exit the loop if there are no more pages left in Google Drive
+        if not page_token:
+            break
 
 # ---------------------------------------------------------------------------
 # Public pipeline
