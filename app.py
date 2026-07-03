@@ -36,15 +36,6 @@ RERANK_TOP_K = int(os.getenv("RERANK_TOP_K", "10"))
 # Initialize the local ranker (downloads a tiny ~30MB model on first run)
 ranker = Ranker(model_name="ms-marco-TinyBERT-L-2-v2")
 
-SYSTEM_PROMPT = (
-    "You are a precise knowledge assistant. Answer the user's question using "
-    "ONLY the provided context. If the context does not contain the answer, "
-    "say you don't have that information. "
-    "CRITICAL RULES FOR CITATIONS:\n"
-    "1. Include an inline citation for every claim you generate.\n"
-    "2. Use the exact format: (Title, pg. X) at the end of each sentence.\n"
-    "3. Do not combine citations. Cite the specific page."
-)
 
 
 # ---------------------------------------------------------------------------
@@ -94,15 +85,63 @@ def get_clients():
 # Retrieval + prompt assembly
 # ---------------------------------------------------------------------------
 
+def rewrite_query(user_query: str) -> str:
+    """
+    Uses a fast LLM call to clean the search query. This prevents proper names 
+    from throwing off the BM25 keyword matching weights.
+    """
+    from langchain_openai import ChatOpenAI
+    
+    # Initialize a fast model with zero temperature for consistent extraction
+    llm = ChatOpenAI(model="gpt-4o-mini", temperature=0)
+    
+    # Prompt the LLM to isolate the core informational intent of the question
+    prompt = (
+        "You are an AI search assistant. Your job is to rewrite the user's question "
+        "into an optimized search query for a vector database. Remove specific "
+        "proper names of authors, publishers, or book titles if they restrict the "
+        "raw informational intent of the question, but keep all technical terms.\n"
+        f"Original question: {user_query}\n"
+        "Optimized search query:"
+    )
+    
+    response = llm.invoke(prompt)
+    return response.content.strip()
+
 def retrieve_context(query: str):
-    """Return the top-K matching chunks (list of metadata dicts) for ``query``."""
     _, embeddings, _, index, index_exists = get_clients()
     if not index_exists or index is None:
         return []
 
-    query_vector = embeddings.embed_query(query)
-    response = index.query(vector=query_vector, top_k=TOP_K, include_metadata=True)
+    # Pass the user query through the rewriter first
+    search_query = rewrite_query(query)
 
+    # Use the cleaned search_query for your embeddings and keyword encoding
+    dense_vec = embeddings.embed_query(search_query)
+
+    try:
+        from pinecone_text.sparse import BM25Encoder # type: ignore
+        bm25 = BM25Encoder.default()
+        sparse_vec = bm25.encode_queries(search_query)
+    except ImportError:
+        # Fallback to empty sparse vector if pinecone-text is not installed
+        sparse_vec = {"indices": [], "values": []}
+
+    alpha = 0.5
+    scaled_dense = [v * alpha for v in dense_vec]
+    scaled_sparse = {
+        "indices": sparse_vec["indices"],
+        "values": [v * (1.0 - alpha) for v in sparse_vec["values"]]
+    }
+
+    # Query the index with the optimized terms
+    response = index.query(
+        vector=scaled_dense,
+        sparse_vector=scaled_sparse,
+        top_k=TOP_K,
+        include_metadata=True
+    )
+    
     # Pinecone QueryResponse behaves like a dict and exposes ``matches``.
     try:
         matches = response["matches"]
@@ -142,29 +181,29 @@ def rerank_contexts(query: str, contexts: List[dict]) -> List[dict]:
     return reranked_results
 
 
-def build_messages(query: str, contexts: List[dict]) -> List[dict]:
-    """Assemble the chat messages, injecting formatted retrieved context."""
-    if contexts:
-        blocks = []
-        for i, ctx in enumerate(contexts, start=1):
-            title = ctx.get("title", "Unknown source")
-            page = ctx.get("page", "Unknown") # Extract the page number from the Pinecone metadata
-            text = ctx.get("text", "")
-            # Inject the page number directly into the context block read by the AI
-            blocks.append(f"[Source {i}: {title}, Page: {page}]\n{text}")
-        context_str = "\n\n---\n\n".join(blocks)
-    else:
-        context_str = "(no relevant context found in the knowledge base)"
-
-    user_content = (
-        f"Context:\n{context_str}\n\n"
-        f"Question: {query}\n\n"
-        "Answer using only the context above."
+def build_messages(user_query: str, contexts: list[dict]) -> list:
+    # Combine the text chunks into a structured context string
+    context_text = "\n\n".join([f"[Page {c.get('page', 'Unknown')}]: {c.get('text', '')}" for c in contexts])
+    
+    # Refine the system instructions with explicit boundaries
+    system_instruction = (
+        "You are a precise technical assistant specializing in finance, 3D modeling, "
+        "and construction. Answer the user's question based only on the provided context.\n"
+        "Follow these strict rules:\n"
+        "1. Always cite the exact page numbers for your facts.\n"
+        "2. If the context mentions both a specific software application name (e.g., Pix4D) "
+        "and an underlying scientific, mathematical, or engineering technique (e.g., Structure from Motion), "
+        "carefully distinguish between the two. Do not substitute a software brand name for the actual "
+        "technical method used."
     )
-    return [
-        {"role": "system", "content": SYSTEM_PROMPT},
-        {"role": "user", "content": user_content},
+    
+    # Construct the message payload for the OpenAI API
+    messages = [
+        {"role": "system", "content": system_instruction},
+        {"role": "user", "content": f"Context:\n{context_text}\n\nQuestion: {user_query}"}
     ]
+    
+    return messages
 
 
 def stream_answer(messages: List[dict]) -> Iterator[str]:
