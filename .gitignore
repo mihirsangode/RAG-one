@@ -2,6 +2,9 @@
 .env
 google_token.json
 *.json.bak
+pdf-rag-*.json
+client_secret_*.json
+openai_api_key*
 
 # Python
 __pycache__/

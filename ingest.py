@@ -30,6 +30,7 @@ from the command line.
 from __future__ import annotations
 
 import hashlib
+import concurrent.futures
 import io
 import json
 import logging
@@ -46,10 +47,59 @@ from dotenv import load_dotenv
 from langchain_core.document_loaders import BaseLoader
 from langchain_core.documents import Document
 
+from llama_index.core import Document as LlamaDocument
+from llama_index.core.node_parser import SemanticSplitterNodeParser
+from llama_index.embeddings.openai import OpenAIEmbedding
+
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
 
+import json
+from pathlib import Path
+
+# The local file that will remember what has been synced
+STATE_FILE = Path("sync_state.json")
+
+# Increase this version number to wipe the index and force a full re-sync
+CHUNK_LOGIC_VERSION = "2.0"
+
+def check_version_and_manage_index(settings: Settings) -> set:
+    """Loads synced files. Wipes index and history if the version changes."""
+    from pinecone import Pinecone
+    if STATE_FILE.exists():
+        with open(STATE_FILE, "r") as f:
+            data = json.load(f)
+            
+            # Check if the code version differs from the saved version
+            if data.get("version") != CHUNK_LOGIC_VERSION:
+                logger.info("Chunking logic version changed. Wiping Pinecone index...")
+                
+                # 1. Connect to Pinecone using the API key from your settings
+                pc = Pinecone(api_key=settings.pinecone_api_key)
+                existing_indexes = set(pc.list_indexes().names())
+                
+                # 2. Delete the entire index if it exists
+                if settings.index_name in existing_indexes:
+                    pc.delete_index(settings.index_name)
+                    logger.info("Index '%s' deleted successfully.", settings.index_name)
+                
+                # 3. Return an empty set so the main loop processes every file as new
+                return set()
+            
+            # If the version matches, return the saved history normally
+            return set(data.get("synced_files", []))
+            
+    # Return an empty set if this is the very first time the script runs
+    return set()
+
+def save_sync_state(synced_files: set):
+    """Saves the updated list of synced file IDs to the local disk."""
+    with open(STATE_FILE, "w") as f:
+        json.dump({
+            "version": CHUNK_LOGIC_VERSION,
+            "synced_files": list(synced_files)
+        }, f)
 load_dotenv()
 
 logging.basicConfig(
@@ -62,9 +112,9 @@ logger = logging.getLogger("rag.ingest")
 # text-embedding-3-small produces 1536-dimensional vectors.
 EMBEDDING_DIMENSION = 1536
 
-# Number of chunks embedded + upserted per network round-trip. Kept small to
-# bound memory and stay friendly to API rate limits.
-BATCH_SIZE = 64
+# Number of chunks embedded + upserted per network round-trip.
+# A size of 100 provides a safe margin for Pinecone's 2MB request limit
+BATCH_SIZE = 100
 
 # How long to wait for the serverless index to become ready before giving up.
 INDEX_READY_TIMEOUT_SECONDS = 300
@@ -96,7 +146,7 @@ class Settings:
             pinecone_cloud=os.getenv("PINECONE_CLOUD", "aws"),
             pinecone_region=os.getenv("PINECONE_REGION", "us-east-1"),
             index_name=os.environ.get("PINECONE_INDEX_NAME", "rag-knowledge-base"),
-            drive_folder_id="1-1sQtFd_zVRE4H4R-rrOGCZnzYdQQ8Zb", # Hardcoded ID
+            drive_folder_id=os.environ.get("GOOGLE_DRIVE_FOLDER_ID", "1-1sQtFd_zVRE4H4R-rrOGCZnzYdQQ8Zb"),
             chunk_size=int(os.getenv("CHUNK_SIZE", "1000")),
             chunk_overlap=int(os.getenv("CHUNK_OVERLAP", "150")),
         )
@@ -229,55 +279,46 @@ class PyPDFBytesLoader(BaseLoader):
         return documents
 
 # ---------------------------------------------------------------------------
-# Dependency-free recursive character text splitter
+# Vector-based semantic text splitter (LlamaIndex)
 # ---------------------------------------------------------------------------
 
-_SEPARATORS: List[str] = ["\n\n", "\n", ". ", " ", ""]
+_semantic_splitter: Optional[SemanticSplitterNodeParser] = None
+
+def _get_semantic_splitter() -> SemanticSplitterNodeParser:
+    """Lazy initialize the semantic splitter node parser."""
+    global _semantic_splitter
+    if _semantic_splitter is None:
+        # Initialize the LlamaIndex embedding model to evaluate sentence meanings.
+        # It automatically retrieves OPENAI_API_KEY from environment variables.
+        embed_model = OpenAIEmbedding(model="text-embedding-3-small")
+        _semantic_splitter = SemanticSplitterNodeParser(
+            buffer_size=1,
+            breakpoint_percentile_threshold=95,
+            embed_model=embed_model
+        )
+    return _semantic_splitter
 
 
-def split_text(text: str, chunk_size: int, chunk_overlap: int) -> List[str]:
-    """Split ``text`` into overlapping chunks on natural boundaries.
-
-    Mirrors the behaviour of a recursive character splitter without pulling in
-    an extra dependency: it greedily packs the largest separator-delimited
-    pieces that fit ``chunk_size``, then carries ``chunk_overlap`` characters of
-    tail context into the next chunk to preserve continuity across boundaries.
-    """
+def split_text_semantically(text: str) -> List[str]:
+    """Split text into semantic chunks based on topic shifts."""
+    # Strip whitespace from the incoming text
     text = (text or "").strip()
+    
+    # Return an empty list if there is no text to process
     if not text:
         return []
-    if len(text) <= chunk_size:
-        return [text]
 
-    # Choose the finest separator that actually appears in the text.
-    separator = next((s for s in _SEPARATORS if s and s in text), "")
-    pieces = text.split(separator) if separator else list(text)
-
-    chunks: List[str] = []
-    current = ""
-    for piece in pieces:
-        candidate = piece if not current else f"{current}{separator}{piece}"
-        if len(candidate) <= chunk_size:
-            current = candidate
-            continue
-
-        if current:
-            chunks.append(current)
-            # Seed the next chunk with the overlap tail of the previous one.
-            tail = current[-chunk_overlap:] if chunk_overlap else ""
-            current = f"{tail}{separator}{piece}" if tail else piece
-        else:
-            # A single piece is larger than chunk_size: hard-window it.
-            for start in range(0, len(piece), max(1, chunk_size - chunk_overlap)):
-                window = piece[start : start + chunk_size]
-                if window:
-                    chunks.append(window)
-            current = ""
-
-    if current:
-        chunks.append(current)
-
-    return [c.strip() for c in chunks if c.strip()]
+    # Get the lazily initialized splitter instance
+    splitter = _get_semantic_splitter()
+    
+    # Wrap the raw string in a LlamaIndex document object for processing
+    document = LlamaDocument(text=text)
+    
+    # Process the document to create semantically cohesive nodes
+    nodes = splitter.get_nodes_from_documents([document])
+    
+    # Extract the raw text from each node and return them as a list of strings
+    return [node.get_content().strip() for node in nodes if node.get_content().strip()]
 
 
 # ---------------------------------------------------------------------------
@@ -369,10 +410,6 @@ def ensure_index_ready(settings: Settings):
 # Document streaming
 # ---------------------------------------------------------------------------
 
-from typing import Iterable
-from pathlib import Path
-from langchain_google_community import GoogleDriveLoader
-
 def _document_stream(settings: Settings, service_account_path: Path) -> Iterable:
     """Yield LangChain Document objects from an entire Google Drive folder."""
     from langchain_google_community import GoogleDriveLoader
@@ -406,6 +443,12 @@ def sync_knowledge_base() -> Iterator[ProgressEvent]:
     yield ProgressEvent("init", "Resolving Google Service Account credentials...")
     service_account_path = _resolve_service_account_path()
 
+    # 1. Run the version checker FIRST, before creating the new index
+    synced_file_ids = check_version_and_manage_index(settings)
+    newly_synced_ids = set()
+
+    # 2. The ensure_index_ready function will automatically create a fresh, 
+    # empty index if the previous step deleted it.
     yield ProgressEvent("index", "Ensuring Pinecone serverless index is ready...")
     index = ensure_index_ready(settings)
 
@@ -428,24 +471,27 @@ def sync_knowledge_base() -> Iterator[ProgressEvent]:
     # documents sharing a file ID (e.g. a multi-page PDF) never collide.
     chunk_counter: dict = defaultdict(int)
 
-    def flush() -> int:
+    # Create an executor to run network tasks in the background
+    # Max workers determines how many batches can upload simultaneously
+    executor = concurrent.futures.ThreadPoolExecutor(max_workers=3)
+    future_uploads: List[concurrent.futures.Future] = []
+
+    def flush(texts: List[str], ids: List[str], metas: List[dict]) -> int:
         """Embed and upsert the current batch. Returns chunks written."""
-        if not pending_texts:
+        if not texts:
             return 0
-        vectors = embeddings.embed_documents(pending_texts)
+        vectors = embeddings.embed_documents(texts)
         payload = [
             {
                 "id": vec_id,
                 "values": vector,
                 "metadata": meta,
             }
-            for vec_id, vector, meta in zip(pending_ids, vectors, pending_meta)
+            for vec_id, vector, meta in zip(ids, vectors, metas)
         ]
         index.upsert(vectors=payload)
         written = len(payload)
-        pending_ids.clear()
-        pending_texts.clear()
-        pending_meta.clear()
+        logger.info("Upserted batch of %d vectors.", written)
         return written
 
     try:
@@ -455,11 +501,15 @@ def sync_knowledge_base() -> Iterator[ProgressEvent]:
             drive_file_id = extract_drive_file_id(metadata)
             title = metadata.get("title") or metadata.get("source") or drive_file_id
 
-            chunks = split_text(
-                document.page_content,
-                settings.chunk_size,
-                settings.chunk_overlap,
-            )
+            # 2. Skip the file if it is already in Pinecone under the current version
+            if drive_file_id in synced_file_ids:
+                logger.info("Skipping already synced file: '%s'", title)
+                continue
+
+            # Call the new semantic splitter instead of the old recursive splitter
+            # Pass only the page content
+            chunks = split_text_semantically(document.page_content)
+            
             if not chunks:
                 logger.warning("File '%s' produced no text; skipping.", title)
                 continue
@@ -485,23 +535,59 @@ def sync_knowledge_base() -> Iterator[ProgressEvent]:
                 chunks_total += 1
 
                 if len(pending_texts) >= BATCH_SIZE:
-                    written = flush()
+                    # Check for early failure in previous uploads to abort stream if a thread failed
+                    for fut in future_uploads:
+                        if fut.done() and fut.exception() is not None:
+                            fut.result()  # raise the exception
+
+                    # Make copies of the lists so the main thread can clear the originals
+                    batch_texts = list(pending_texts)
+                    batch_ids = list(pending_ids)
+                    batch_metas = list(pending_meta)
+
+                    # Send the batch to upload in the background
+                    future = executor.submit(flush, batch_texts, batch_ids, batch_metas)
+                    future_uploads.append(future)
+
+                    # Clear the original lists immediately to collect the next batch
+                    pending_ids.clear()
+                    pending_texts.clear()
+                    pending_meta.clear()
+
                     yield ProgressEvent(
                         "upsert",
-                        f"Indexed {chunks_total} chunks across {files_seen} file(s)...",
+                        f"Indexed {chunks_total} chunks across {files_seen} file(s) (uploading in background)...",
                         progress=None,
                     )
-                    logger.info("Upserted batch of %d vectors.", written)
 
             # Release the document body promptly to keep memory flat.
             del chunks
+            
+            # 3. Mark this file as successfully processed for this run
+            newly_synced_ids.add(drive_file_id)
 
         # Final partial batch.
-        written = flush()
-        if written:
-            logger.info("Upserted final batch of %d vectors.", written)
+        if pending_texts:
+            batch_texts = list(pending_texts)
+            batch_ids = list(pending_ids)
+            batch_metas = list(pending_meta)
+            future = executor.submit(flush, batch_texts, batch_ids, batch_metas)
+            future_uploads.append(future)
+            pending_ids.clear()
+            pending_texts.clear()
+            pending_meta.clear()
+
+        # Wait for all background uploads to complete before finishing the sync
+        for future in concurrent.futures.as_completed(future_uploads):
+            future.result()  # Propagate any exceptions
+
+        # 4. Save the combined history of old and new files back to the JSON file
+        synced_file_ids.update(newly_synced_ids)
+        save_sync_state(synced_file_ids)
 
     finally:
+        # Shut down the executor and clean up
+        executor.shutdown(wait=True)
         # If we materialised a temp credential file, remove it.
         if os.getenv("GOOGLE_CREDENTIALS_JSON", "").strip():
             try:

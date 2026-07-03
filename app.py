@@ -52,26 +52,6 @@ st.set_page_config(
     layout="centered",
     initial_sidebar_state="expanded",
 )
-
-# st.set_page_config remains the same
-st.set_page_config(
-    page_title="Knowledge Assistant",
-    page_icon="brain",
-    layout="centered",
-    initial_sidebar_state="expanded",
-)
-
-# DELETE OR COMMENT OUT THIS ENTIRE BLOCK
-# st.markdown(
-#     """
-#     <style>
-#       /* Hide Streamlit chrome for a clean, app-like surface. */
-# ... [rest of the CSS] ...
-#     </style>
-#     """,
-#     unsafe_allow_html=True,
-# )
-
 # The rest of your code continues below
 
 

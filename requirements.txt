@@ -4,3 +4,6 @@ pinecone
 pypdf
 python-dotenv
 streamlit
+# LlamaIndex dependencies for semantic chunking
+llama-index-core
+llama-index-embeddings-openai
