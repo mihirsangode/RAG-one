@@ -62,7 +62,7 @@ from pathlib import Path
 STATE_FILE = Path("sync_state.json")
 
 # Increase this version number to wipe the index and force a full re-sync
-CHUNK_LOGIC_VERSION = "4.0"
+CHUNK_LOGIC_VERSION = "5.0"
 
 def check_version_and_manage_index(settings: Settings) -> set:
     """Loads synced files. Wipes index and history if the version changes."""
@@ -426,9 +426,6 @@ def _document_stream(settings: Settings, service_account_path: Path) -> Iterable
     )
     service = build('drive', 'v3', credentials=creds)
 
-    query = f"'{settings.drive_folder_id}' in parents and mimeType='application/pdf' and trashed=false"
-    page_token = None
-    
     # Restrict concurrent downloads to 3 to prevent exceeding 512 MB of RAM
     MAX_CONCURRENT_DOWNLOADS = 3
 
@@ -463,39 +460,54 @@ def _document_stream(settings: Settings, service_account_path: Path) -> Iterable
             
         return docs
 
-    # Loop continuously until all pages of the Google Drive folder are read
-    while True:
-        # Request a maximum of 100 file names per API call to keep memory flat
-        results = service.files().list(
-            q=query, 
-            pageSize=100, 
-            pageToken=page_token,
-            fields="nextPageToken, files(id, name)"
-        ).execute()
+    folders_to_process = [settings.drive_folder_id]
+
+    while folders_to_process:
+        current_folder_id = folders_to_process.pop(0)
+        query = f"'{current_folder_id}' in parents and (mimeType='application/pdf' or mimeType='application/vnd.google-apps.folder') and trashed=false"
+        page_token = None
         
-        items = results.get('files', [])
-
-        if not items:
-            break
-
-        # Execute downloads concurrently for the current batch of 100 files
-        with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_CONCURRENT_DOWNLOADS) as executor:
-            future_to_file = {executor.submit(download_and_parse, item): item for item in items}
+        # Loop continuously until all pages of the current Google Drive folder are read
+        while True:
+            # Request a maximum of 100 file names per API call to keep memory flat
+            results = service.files().list(
+                q=query, 
+                pageSize=100, 
+                pageToken=page_token,
+                fields="nextPageToken, files(id, name, mimeType)"
+            ).execute()
             
-            for future in concurrent.futures.as_completed(future_to_file):
-                try:
-                    docs = future.result()
-                    yield from docs
-                except Exception as exc:
-                    failed_item = future_to_file[future]
-                    logger.error("Failed to process file '%s': %s", failed_item.get('name'), exc)
+            all_items = results.get('files', [])
 
-        # Retrieve the token for the next page of 100 files
-        page_token = results.get('nextPageToken')
-        
-        # Exit the loop if there are no more pages left in Google Drive
-        if not page_token:
-            break
+            if not all_items:
+                break
+                
+            pdf_items = []
+            for item in all_items:
+                if item.get('mimeType') == 'application/vnd.google-apps.folder':
+                    folders_to_process.append(item['id'])
+                elif item.get('mimeType') == 'application/pdf':
+                    pdf_items.append(item)
+
+            if pdf_items:
+                # Execute downloads concurrently for the current batch of PDF files
+                with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_CONCURRENT_DOWNLOADS) as executor:
+                    future_to_file = {executor.submit(download_and_parse, item): item for item in pdf_items}
+                    
+                    for future in concurrent.futures.as_completed(future_to_file):
+                        try:
+                            docs = future.result()
+                            yield from docs
+                        except Exception as exc:
+                            failed_item = future_to_file[future]
+                            logger.error("Failed to process file '%s': %s", failed_item.get('name'), exc)
+
+            # Retrieve the token for the next page of 100 files
+            page_token = results.get('nextPageToken')
+            
+            # Exit the loop if there are no more pages left in current folder
+            if not page_token:
+                break
 
 # ---------------------------------------------------------------------------
 # Public pipeline
