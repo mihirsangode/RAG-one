@@ -113,34 +113,53 @@ def retrieve_context(query: str):
     if not index_exists or index is None:
         return []
 
-    # Pass the user query through the rewriter first
-    search_query = rewrite_query(query)
-
-    # Use the cleaned search_query for your embeddings and keyword encoding
-    dense_vec = embeddings.embed_query(search_query)
-
     try:
         from pinecone_text.sparse import BM25Encoder # type: ignore
         bm25 = BM25Encoder.default()
-        sparse_vec = bm25.encode_queries(search_query)
     except ImportError:
+        bm25 = None
+
+    # Pass the user query through the rewriter first
+    search_query = rewrite_query(query)
+    
+    # Safety Check 1: If the LLM rewriter accidentally deleted everything, 
+    # revert back to the user's original raw text.
+    if not search_query.strip():
+        search_query = query
+
+    # Generate vectors
+    dense_vec = embeddings.embed_query(search_query)
+    
+    if bm25:
+        sparse_vec = bm25.encode_queries(search_query)
+    else:
         # Fallback to empty sparse vector if pinecone-text is not installed
         sparse_vec = {"indices": [], "values": []}
 
-    alpha = 0.5
-    scaled_dense = [v * alpha for v in dense_vec]
-    scaled_sparse = {
-        "indices": sparse_vec["indices"],
-        "values": [v * (1.0 - alpha) for v in sparse_vec["values"]]
-    }
+    # Safety Check 2: Did BM25 filter out all the words?
+    if len(sparse_vec["values"]) == 0:
+        # The sparse vector is empty. Skip hybrid search and use only the dense vector.
+        response = index.query(
+            vector=dense_vec,
+            top_k=TOP_K,
+            include_metadata=True
+        )
+    else:
+        # The sparse vector has data. Proceed with the standard Hybrid Search calculation.
+        alpha = 0.5
+        scaled_dense = [v * alpha for v in dense_vec]
+        scaled_sparse = {
+            "indices": sparse_vec["indices"],
+            "values": [v * (1.0 - alpha) for v in sparse_vec["values"]]
+        }
 
-    # Query the index with the optimized terms
-    response = index.query(
-        vector=scaled_dense,
-        sparse_vector=scaled_sparse,
-        top_k=TOP_K,
-        include_metadata=True
-    )
+        # Query Pinecone using both mathematical meaning and exact keywords
+        response = index.query(
+            vector=scaled_dense,
+            sparse_vector=scaled_sparse,
+            top_k=TOP_K,
+            include_metadata=True
+        )
     
     # Pinecone QueryResponse behaves like a dict and exposes ``matches``.
     try:
