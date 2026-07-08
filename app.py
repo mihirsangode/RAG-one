@@ -181,7 +181,7 @@ def rerank_contexts(query: str, contexts: List[dict]) -> List[dict]:
     return reranked_results
 
 
-def build_messages(user_query: str, contexts: list[dict]) -> list:
+def build_messages(user_query: str, contexts: list[dict], chat_history: list) -> list:
     # Combine the text chunks into a structured context string
     context_text = "\n\n".join([f"[Page {c.get('page', 'Unknown')}]: {c.get('text', '')}" for c in contexts])
     
@@ -197,11 +197,17 @@ def build_messages(user_query: str, contexts: list[dict]) -> list:
         "technical method used."
     )
     
-    # Construct the message payload for the OpenAI API
-    messages = [
-        {"role": "system", "content": system_instruction},
-        {"role": "user", "content": f"Context:\n{context_text}\n\nQuestion: {user_query}"}
-    ]
+    messages = [{"role": "system", "content": system_instruction}]
+    
+    # 1. Inject the historical conversation so the AI remembers context
+    for msg in chat_history:
+        messages.append({"role": msg["role"], "content": msg["content"]})
+        
+    # 2. Append the current question, heavily loaded with the new RAG context
+    messages.append({
+        "role": "user", 
+        "content": f"Context:\n{context_text}\n\nQuestion: {user_query}"
+    })
     
     return messages
 
@@ -276,45 +282,53 @@ def render_sidebar() -> None:
 # ---------------------------------------------------------------------------
 
 def render_chat() -> None:
-    if "messages" not in st.session_state:
-        st.session_state.messages = []
+    # 1. Initialize the memory bank on the first page load
+    if "chat_history" not in st.session_state:
+        st.session_state.chat_history = []
 
-    for message in st.session_state.messages:
+    # 2. Draw all historical messages on the screen
+    for message in st.session_state.chat_history:
         with st.chat_message(message["role"]):
             st.markdown(message["content"])
 
+    # 3. Wait for new user input
     prompt = st.chat_input("Ask a question about your documents...")
-    if not prompt:
-        return
+    if prompt:
+        # Draw the new user message immediately
+        with st.chat_message("user"):
+            st.markdown(prompt)
 
-    st.session_state.messages.append({"role": "user", "content": prompt})
-    with st.chat_message("user"):
-        st.markdown(prompt)
-
-    with st.chat_message("assistant"):
-        with st.spinner("Searching the knowledge base..."):
-            contexts = retrieve_context(prompt)
-            reranked_contexts = rerank_contexts(prompt, contexts)
-            messages = build_messages(prompt, reranked_contexts)
-        answer = st.write_stream(stream_answer(messages))
-
-        if reranked_contexts:
-            # 2. Use a set to track distinct combinations of title and page
-            seen_sources = set()
-            for ctx in reranked_contexts:
-                title = ctx.get("title", "Unknown source")
-                page = ctx.get("page", "Unknown")
+        # Run the RAG pipeline
+        with st.chat_message("assistant"):
+            with st.spinner("Searching and reranking the knowledge base..."):
+                contexts = retrieve_context(prompt)
+                reranked_contexts = rerank_contexts(prompt, contexts)
                 
-                # Combine title and page into a single string for display
-                source_label = f"{title}, pg. {page}"
-                seen_sources.add(source_label)
-            
-            with st.expander("Sources"):
-                # Sort the distinct sources alphabetically for clean reading
-                for source in sorted(seen_sources):
-                    st.markdown(f"- {source}")
+                # 4. Pass the history into the prompt builder
+                messages = build_messages(prompt, reranked_contexts, st.session_state.chat_history)
+                
+            # Stream the answer to the UI
+            answer = st.write_stream(stream_answer(messages))
 
-    st.session_state.messages.append({"role": "assistant", "content": answer})
+            if reranked_contexts:
+                # Use a set to track distinct combinations of title and page
+                seen_sources = set()
+                for ctx in reranked_contexts:
+                    title = ctx.get("title", "Unknown source")
+                    page = ctx.get("page", "Unknown")
+                    
+                    # Combine title and page into a single string for display
+                    source_label = f"{title}, pg. {page}"
+                    seen_sources.add(source_label)
+                
+                with st.expander("Sources"):
+                    # Sort the distinct sources alphabetically for clean reading
+                    for source in sorted(seen_sources):
+                        st.markdown(f"- {source}")
+
+        # 5. Save the clean exchange to the memory bank for the NEXT turn
+        st.session_state.chat_history.append({"role": "user", "content": prompt})
+        st.session_state.chat_history.append({"role": "assistant", "content": answer})
 
 
 # ---------------------------------------------------------------------------

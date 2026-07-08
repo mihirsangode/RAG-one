@@ -62,7 +62,7 @@ from pathlib import Path
 STATE_FILE = Path("sync_state.json")
 
 # Increase this version number to wipe the index and force a full re-sync
-CHUNK_LOGIC_VERSION = "2.0"
+CHUNK_LOGIC_VERSION = "4.0"
 
 def check_version_and_manage_index(settings: Settings) -> set:
     """Loads synced files. Wipes index and history if the version changes."""
@@ -379,7 +379,7 @@ def ensure_index_ready(settings: Settings):
         pc.create_index(
             name=settings.index_name,
             dimension=EMBEDDING_DIMENSION,
-            metric="cosine",
+            metric="dotproduct",
             spec=ServerlessSpec(
                 cloud=settings.pinecone_cloud,
                 region=settings.pinecone_region,

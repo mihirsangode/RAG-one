@@ -11,7 +11,7 @@ service = build('drive', 'v3', credentials=creds)
 channel = {
     "id": "rag-drive-webhook-channel-1", # A unique ID for this channel
     "type": "web_hook",
-    "address": "https://rag-webhook-listener.onrender.com/drive-webhook" 
+    "address": "https://rag-webhook-listener-ku2f.onrender.com/drive-webhook" 
 }
 
 # Use the 'watch' method on the folder ID found in .env
