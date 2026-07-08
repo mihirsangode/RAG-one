@@ -108,70 +108,74 @@ def rewrite_query(user_query: str) -> str:
     response = llm.invoke(prompt)
     return response.content.strip()
 
+def generate_query_variations(query: str) -> list[str]:
+    """Helper to return original and rewritten queries for multi-query search."""
+    rewritten = rewrite_query(query)
+    variations = [query]
+    if rewritten and rewritten.lower() != query.lower():
+        variations.append(rewritten)
+    return variations
+
 def retrieve_context(query: str):
     _, embeddings, _, index, index_exists = get_clients()
     if not index_exists or index is None:
         return []
 
     try:
-        from pinecone_text.sparse import BM25Encoder # type: ignore
+        from pinecone_text.sparse import BM25Encoder  # type: ignore
         bm25 = BM25Encoder.default()
     except ImportError:
         bm25 = None
 
-    # Pass the user query through the rewriter first
-    search_query = rewrite_query(query)
+    # 1. Get the list of paraphrased queries (including the original)
+    search_queries = generate_query_variations(query)
     
-    # Safety Check 1: If the LLM rewriter accidentally deleted everything, 
-    # revert back to the user's original raw text.
-    if not search_query.strip():
-        search_query = query
+    # 2. Create a dictionary to hold unique chunks and remove duplicates
+    unique_chunks = {}
 
-    # Generate vectors
-    dense_vec = embeddings.embed_query(search_query)
+    # 3. Loop through every query variation safely
+    for sq in search_queries:
+        if not sq.strip():
+            continue
+
+        # Generate vectors for this specific text variation
+        dense_vec = embeddings.embed_query(sq)
+        sparse_vec = bm25.encode_queries(sq) if bm25 else {"indices": [], "values": []}
+
+        # 4. Safety Check: Did BM25 return valid keywords?
+        # Using .get() adds a secondary layer of protection against malformed dicts
+        if not sparse_vec or len(sparse_vec.get("values", [])) == 0:
+            # DENSE ONLY SEARCH: The sparse_vector argument is completely removed here
+            response = index.query(
+                vector=dense_vec,
+                top_k=TOP_K,
+                include_metadata=True
+            )
+        else:
+            # HYBRID SEARCH: Both vectors are valid
+            alpha = 0.5
+            scaled_dense = [v * alpha for v in dense_vec]
+            scaled_sparse = {
+                "indices": sparse_vec["indices"],
+                "values": [v * (1.0 - alpha) for v in sparse_vec["values"]]
+            }
+            
+            response = index.query(
+                vector=scaled_dense,
+                sparse_vector=scaled_sparse,
+                top_k=TOP_K,
+                include_metadata=True
+            )
+        
+        # 5. Extract chunks and add them to the deduplication dictionary
+        for match in response.get('matches', []):
+            chunk_text = match['metadata']['text']
+            # Dictionaries automatically prevent duplicates if you use the text as the key
+            if chunk_text not in unique_chunks:
+                unique_chunks[chunk_text] = match['metadata']
     
-    if bm25:
-        sparse_vec = bm25.encode_queries(search_query)
-    else:
-        # Fallback to empty sparse vector if pinecone-text is not installed
-        sparse_vec = {"indices": [], "values": []}
-
-    # Safety Check 2: Did BM25 filter out all the words?
-    if len(sparse_vec["values"]) == 0:
-        # The sparse vector is empty. Skip hybrid search and use only the dense vector.
-        response = index.query(
-            vector=dense_vec,
-            top_k=TOP_K,
-            include_metadata=True
-        )
-    else:
-        # The sparse vector has data. Proceed with the standard Hybrid Search calculation.
-        alpha = 0.5
-        scaled_dense = [v * alpha for v in dense_vec]
-        scaled_sparse = {
-            "indices": sparse_vec["indices"],
-            "values": [v * (1.0 - alpha) for v in sparse_vec["values"]]
-        }
-
-        # Query Pinecone using both mathematical meaning and exact keywords
-        response = index.query(
-            vector=scaled_dense,
-            sparse_vector=scaled_sparse,
-            top_k=TOP_K,
-            include_metadata=True
-        )
-    
-    # Pinecone QueryResponse behaves like a dict and exposes ``matches``.
-    try:
-        matches = response["matches"]
-    except (TypeError, KeyError):
-        matches = getattr(response, "matches", []) or []
-
-    results = []
-    for match in matches:
-        metadata = match["metadata"] if isinstance(match, dict) else match.metadata
-        results.append(dict(metadata or {}))
-    return results
+    # 6. Convert the dictionary values back into a list for the reranker
+    return list(unique_chunks.values())
 
 
 def rerank_contexts(query: str, contexts: List[dict]) -> List[dict]:

@@ -10,3 +10,4 @@ llama-index-embeddings-openai
 flashrank
 fastapi
 uvicorn
+pinecone-text
