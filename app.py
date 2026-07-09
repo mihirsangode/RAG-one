@@ -30,7 +30,6 @@ from ingest import Settings, sync_knowledge_base
 load_dotenv()
 
 CHAT_MODEL = os.getenv("OPENAI_CHAT_MODEL", "gpt-4o-mini")
-TOP_K = int(os.getenv("TOP_K", "50"))
 RERANK_TOP_K = int(os.getenv("RERANK_TOP_K", "10"))
 
 # Initialize the local ranker (downloads a tiny ~30MB model on first run)
@@ -85,97 +84,28 @@ def get_clients():
 # Retrieval + prompt assembly
 # ---------------------------------------------------------------------------
 
-def rewrite_query(user_query: str) -> str:
-    """
-    Uses a fast LLM call to clean the search query. This prevents proper names 
-    from throwing off the BM25 keyword matching weights.
-    """
-    from langchain_openai import ChatOpenAI
-    
-    # Initialize a fast model with zero temperature for consistent extraction
-    llm = ChatOpenAI(model="gpt-4o-mini", temperature=0)
-    
-    # Prompt the LLM to isolate the core informational intent of the question
-    prompt = (
-        "You are an AI search assistant. Your job is to rewrite the user's question "
-        "into an optimized search query for a vector database. Remove specific "
-        "proper names of authors, publishers, or book titles if they restrict the "
-        "raw informational intent of the question, but keep all technical terms.\n"
-        f"Original question: {user_query}\n"
-        "Optimized search query:"
-    )
-    
-    response = llm.invoke(prompt)
-    return response.content.strip()
-
-def generate_query_variations(query: str) -> list[str]:
-    """Helper to return original and rewritten queries for multi-query search."""
-    rewritten = rewrite_query(query)
-    variations = [query]
-    if rewritten and rewritten.lower() != query.lower():
-        variations.append(rewritten)
-    return variations
-
 def retrieve_context(query: str):
+    # Retrieve the active clients for OpenAI and Pinecone
     _, embeddings, _, index, index_exists = get_clients()
     if not index_exists or index is None:
         return []
 
-    try:
-        from pinecone_text.sparse import BM25Encoder  # type: ignore
-        bm25 = BM25Encoder.default()
-    except ImportError:
-        bm25 = None
+    # 1. Convert the user's text query into a dense mathematical vector
+    dense_vec = embeddings.embed_query(query)
 
-    # 1. Get the list of paraphrased queries (including the original)
-    search_queries = generate_query_variations(query)
+    # 2. Query Pinecone using ONLY the dense vector (Sparse parameters removed)
+    response = index.query(
+        vector=dense_vec,
+        top_k=5, # Fetch the top 5 conceptual matches
+        include_metadata=True
+    )
+
+    # 3. Extract the text chunks from the payload and return them as a list
+    unique_chunks = []
+    for match in response.get('matches', []):
+         unique_chunks.append(match['metadata'])
     
-    # 2. Create a dictionary to hold unique chunks and remove duplicates
-    unique_chunks = {}
-
-    # 3. Loop through every query variation safely
-    for sq in search_queries:
-        if not sq.strip():
-            continue
-
-        # Generate vectors for this specific text variation
-        dense_vec = embeddings.embed_query(sq)
-        sparse_vec = bm25.encode_queries(sq) if bm25 else {"indices": [], "values": []}
-
-        # 4. Safety Check: Did BM25 return valid keywords?
-        # Using .get() adds a secondary layer of protection against malformed dicts
-        if not sparse_vec or len(sparse_vec.get("values", [])) == 0:
-            # DENSE ONLY SEARCH: The sparse_vector argument is completely removed here
-            response = index.query(
-                vector=dense_vec,
-                top_k=TOP_K,
-                include_metadata=True
-            )
-        else:
-            # HYBRID SEARCH: Both vectors are valid
-            alpha = 0.5
-            scaled_dense = [v * alpha for v in dense_vec]
-            scaled_sparse = {
-                "indices": sparse_vec["indices"],
-                "values": [v * (1.0 - alpha) for v in sparse_vec["values"]]
-            }
-            
-            response = index.query(
-                vector=scaled_dense,
-                sparse_vector=scaled_sparse,
-                top_k=TOP_K,
-                include_metadata=True
-            )
-        
-        # 5. Extract chunks and add them to the deduplication dictionary
-        for match in response.get('matches', []):
-            chunk_text = match['metadata']['text']
-            # Dictionaries automatically prevent duplicates if you use the text as the key
-            if chunk_text not in unique_chunks:
-                unique_chunks[chunk_text] = match['metadata']
-    
-    # 6. Convert the dictionary values back into a list for the reranker
-    return list(unique_chunks.values())
+    return unique_chunks
 
 
 def rerank_contexts(query: str, contexts: List[dict]) -> List[dict]:

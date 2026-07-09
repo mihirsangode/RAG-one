@@ -55,9 +55,6 @@ from llama_index.embeddings.openai import OpenAIEmbedding
 # Configuration
 # ---------------------------------------------------------------------------
 
-import json
-from pathlib import Path
-
 # The local file that will remember what has been synced
 STATE_FILE = Path("sync_state.json")
 
@@ -497,7 +494,7 @@ def _document_stream(settings: Settings, service_account_path: Path) -> Iterable
                     for future in concurrent.futures.as_completed(future_to_file):
                         try:
                             docs = future.result()
-                            yield from docs
+                            yield docs
                         except Exception as exc:
                             failed_item = future_to_file[future]
                             logger.error("Failed to process file '%s': %s", failed_item.get('name'), exc)
@@ -542,10 +539,6 @@ def sync_knowledge_base() -> Iterator[ProgressEvent]:
 
     yield ProgressEvent("load", "Streaming documents from Google Drive...")
 
-    pending_ids: List[str] = []
-    pending_texts: List[str] = []
-    pending_meta: List[dict] = []
-
     files_seen = 0
     chunks_total = 0
     # Per-file running index so that re-syncs are deterministic and so multiple
@@ -576,9 +569,14 @@ def sync_knowledge_base() -> Iterator[ProgressEvent]:
         return written
 
     try:
-        for document in _document_stream(settings, service_account_path):
+        import gc
+        for docs in _document_stream(settings, service_account_path):
+            if not docs:
+                continue
+                
             files_seen += 1
-            metadata = dict(getattr(document, "metadata", {}) or {})
+            # Docs is a list of Document objects representing one file
+            metadata = dict(getattr(docs[0], "metadata", {}) or {})
             drive_file_id = extract_drive_file_id(metadata)
             title = metadata.get("title") or metadata.get("source") or drive_file_id
 
@@ -587,80 +585,71 @@ def sync_knowledge_base() -> Iterator[ProgressEvent]:
                 logger.info("Skipping already synced file: '%s'", title)
                 continue
 
-            # Call the new semantic splitter instead of the old recursive splitter
-            # Pass only the page content
-            chunks = split_text_semantically(document.page_content)
+            file_chunks = []
+            file_ids = []
+            file_metas = []
+
+            for document in docs:
+                # Call the new semantic splitter instead of the old recursive splitter
+                # Pass only the page content
+                chunks = split_text_semantically(document.page_content)
+                if not chunks:
+                    continue
+
+                for chunk in chunks:
+                    chunk_index = chunk_counter[drive_file_id]
+                    chunk_counter[drive_file_id] += 1
+                    file_ids.append(make_vector_id(drive_file_id, chunk_index))
+                    file_chunks.append(chunk)
+                    # Retrieve the page number from the document metadata, defaulting to "Unknown"
+                    page_num = document.metadata.get("page", "Unknown")
+
+                    file_metas.append(
+                        {
+                            "text": chunk,
+                            "source": str(document.metadata.get("source", "")),
+                            "title": str(title),
+                            "file_id": drive_file_id,
+                            "chunk_index": chunk_index,
+                            "page": page_num, # Append the specific page number to the Pinecone payload
+                        }
+                    )
             
-            if not chunks:
+            if not file_chunks:
                 logger.warning("File '%s' produced no text; skipping.", title)
                 continue
 
-            for chunk in chunks:
-                chunk_index = chunk_counter[drive_file_id]
-                chunk_counter[drive_file_id] += 1
-                pending_ids.append(make_vector_id(drive_file_id, chunk_index))
-                pending_texts.append(chunk)
-                # Retrieve the page number from the document metadata, defaulting to "Unknown"
-                page_num = metadata.get("page", "Unknown")
+            chunks_total += len(file_chunks)
 
-                pending_meta.append(
-                    {
-                        "text": chunk,
-                        "source": str(metadata.get("source", "")),
-                        "title": str(title),
-                        "file_id": drive_file_id,
-                        "chunk_index": chunk_index,
-                        "page": page_num, # Append the specific page number to the Pinecone payload
-                    }
-                )
-                chunks_total += 1
+            # Process and upload this specific file's chunks in batches
+            for i in range(0, len(file_chunks), BATCH_SIZE):
+                batch_texts = file_chunks[i:i+BATCH_SIZE]
+                batch_ids = file_ids[i:i+BATCH_SIZE]
+                batch_metas = file_metas[i:i+BATCH_SIZE]
+                
+                future = executor.submit(flush, batch_texts, batch_ids, batch_metas)
+                future_uploads.append(future)
 
-                if len(pending_texts) >= BATCH_SIZE:
-                    # Check for early failure in previous uploads to abort stream if a thread failed
-                    for fut in future_uploads:
-                        if fut.done() and fut.exception() is not None:
-                            fut.result()  # raise the exception
+            yield ProgressEvent(
+                "upsert",
+                f"Indexed {chunks_total} chunks across {files_seen} file(s)...",
+                progress=None,
+            )
 
-                    # Make copies of the lists so the main thread can clear the originals
-                    batch_texts = list(pending_texts)
-                    batch_ids = list(pending_ids)
-                    batch_metas = list(pending_meta)
-
-                    # Send the batch to upload in the background
-                    future = executor.submit(flush, batch_texts, batch_ids, batch_metas)
-                    future_uploads.append(future)
-
-                    # Clear the original lists immediately to collect the next batch
-                    pending_ids.clear()
-                    pending_texts.clear()
-                    pending_meta.clear()
-
-                    yield ProgressEvent(
-                        "upsert",
-                        f"Indexed {chunks_total} chunks across {files_seen} file(s) (uploading in background)...",
-                        progress=None,
-                    )
-
-            # Release the document body promptly to keep memory flat.
-            del chunks
+            # Wait for this file's uploads to complete before moving to the next file
+            for future in concurrent.futures.as_completed(future_uploads):
+                future.result()  # Propagate any exceptions
+            future_uploads.clear()
             
             # 3. Mark this file as successfully processed for this run
             newly_synced_ids.add(drive_file_id)
 
-        # Final partial batch.
-        if pending_texts:
-            batch_texts = list(pending_texts)
-            batch_ids = list(pending_ids)
-            batch_metas = list(pending_meta)
-            future = executor.submit(flush, batch_texts, batch_ids, batch_metas)
-            future_uploads.append(future)
-            pending_ids.clear()
-            pending_texts.clear()
-            pending_meta.clear()
-
-        # Wait for all background uploads to complete before finishing the sync
-        for future in concurrent.futures.as_completed(future_uploads):
-            future.result()  # Propagate any exceptions
+            # Explicit memory cleanup for this file
+            del docs
+            del file_chunks
+            del file_ids
+            del file_metas
+            gc.collect()
 
         # 4. Save the combined history of old and new files back to the JSON file
         synced_file_ids.update(newly_synced_ids)
