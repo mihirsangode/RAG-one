@@ -23,17 +23,12 @@ from typing import Iterator, List
 
 import streamlit as st
 from dotenv import load_dotenv
-from flashrank import Ranker, RerankRequest
 
 from ingest import Settings, sync_knowledge_base
 
 load_dotenv()
 
 CHAT_MODEL = os.getenv("OPENAI_CHAT_MODEL", "gpt-4o-mini")
-RERANK_TOP_K = int(os.getenv("RERANK_TOP_K", "10"))
-
-# Initialize the local ranker (downloads a tiny ~30MB model on first run)
-ranker = Ranker(model_name="ms-marco-TinyBERT-L-2-v2")
 
 
 
@@ -106,32 +101,6 @@ def retrieve_context(query: str):
          unique_chunks.append(match['metadata'])
     
     return unique_chunks
-
-
-def rerank_contexts(query: str, contexts: List[dict]) -> List[dict]:
-    """Score the retrieved chunks locally."""
-    if not contexts:
-        return []
-
-    # Format the data exactly as FlashRank expects it
-    passages = []
-    for i, ctx in enumerate(contexts):
-        passages.append({
-            "id": i,
-            "text": ctx.get("text", ""),
-            "meta": ctx
-        })
-
-    # Execute the local reranking model
-    rerankrequest = RerankRequest(query=query, passages=passages)
-    results = ranker.rerank(rerankrequest)
-
-    # Extract the top N results and return their original metadata
-    reranked_results = []
-    for result in results[:RERANK_TOP_K]:
-        reranked_results.append(result["meta"])
-
-    return reranked_results
 
 
 def build_messages(user_query: str, contexts: list[dict], chat_history: list) -> list:
@@ -253,20 +222,19 @@ def render_chat() -> None:
 
         # Run the RAG pipeline
         with st.chat_message("assistant"):
-            with st.spinner("Searching and reranking the knowledge base..."):
+            with st.spinner("Searching the knowledge base..."):
                 contexts = retrieve_context(prompt)
-                reranked_contexts = rerank_contexts(prompt, contexts)
                 
                 # 4. Pass the history into the prompt builder
-                messages = build_messages(prompt, reranked_contexts, st.session_state.chat_history)
+                messages = build_messages(prompt, contexts, st.session_state.chat_history)
                 
             # Stream the answer to the UI
             answer = st.write_stream(stream_answer(messages))
 
-            if reranked_contexts:
+            if contexts:
                 # Use a set to track distinct combinations of title and page
                 seen_sources = set()
-                for ctx in reranked_contexts:
+                for ctx in contexts:
                     title = ctx.get("title", "Unknown source")
                     page = ctx.get("page", "Unknown")
                     
